@@ -25,7 +25,7 @@ jobs:
       - name: Install parsers
         run: python -m pip install --disable-pip-version-check pandas lxml beautifulsoup4 html5lib openpyxl requests
 
-      - name: Download and parse public catalogue
+      - name: Download and inspect public catalogue
         shell: bash
         run: |
           set -euo pipefail
@@ -35,103 +35,104 @@ jobs:
           import io
           import json
           import re
+          from collections import Counter
           from pathlib import Path
 
           import pandas as pd
           import requests
+          from bs4 import BeautifulSoup
 
           URL = "https://www.centroricerchebitonto.com/biblioteca/catalogo_biblioteca.html"
           OUT = Path("audit_output")
           headers = {
-              "User-Agent": "Mozilla/5.0 (compatible; CentroRicercheCatalogAudit/1.0; +https://github.com/lucaavellis/bitonto-bdm-prova)"
+              "User-Agent": "Mozilla/5.0 (compatible; CentroRicercheCatalogAudit/1.1; +https://github.com/lucaavellis/bitonto-bdm-prova)"
           }
           response = requests.get(URL, headers=headers, timeout=180)
           response.raise_for_status()
           content = response.content
+          raw_text = response.text
           (OUT / "catalogo_biblioteca.html").write_bytes(content)
 
-          tables = pd.read_html(io.BytesIO(content), displayed_only=False)
-          if not tables:
-              raise RuntimeError("No HTML table found")
-          df = max(tables, key=lambda x: x.shape[0] * max(x.shape[1], 1)).copy()
+          soup = BeautifulSoup(content, "lxml")
+          tag_counts = Counter(tag.name for tag in soup.find_all(True))
+          class_counts = Counter()
+          for tag in soup.find_all(True):
+              for cls in tag.get("class", []):
+                  class_counts[cls] += 1
 
-          def clean_header(value: object) -> str:
-              text = " ".join(str(value).split()).strip()
-              text = re.sub(r"[^0-9A-Za-zÀ-ÖØ-öø-ÿ_]+", "_", text).strip("_")
-              return text or "COLONNA"
+          needles = [
+              "INVENTARIO", "COLLOCAZIONE", "FONDO", "LIVELLO_BIBLIOGRAFICO",
+              "TIPO_DOCUMENTO", "AUTORE_PRINCIPALE", "TITOLO", "PUBBLICAZIONE",
+              "DESCRIZIONE_FISICA", "ISBN", "SOGGETTO1", "NOTE_GENERALI", "ISBD"
+          ]
+          occurrences = {}
+          for needle in needles:
+              starts = [m.start() for m in re.finditer(re.escape(needle), raw_text, flags=re.I)]
+              snippets = []
+              for pos in (starts[:3] + starts[-3:] if starts else []):
+                  snippets.append(raw_text[max(0, pos - 400): min(len(raw_text), pos + 1200)])
+              occurrences[needle] = {"count": len(starts), "snippets": snippets}
 
-          if isinstance(df.columns, pd.MultiIndex):
-              df.columns = [clean_header("_".join(str(v) for v in col if str(v) != "nan")) for col in df.columns]
-          else:
-              df.columns = [clean_header(col) for col in df.columns]
+          scripts = []
+          for i, script in enumerate(soup.find_all("script")):
+              text = script.string or script.get_text("\n", strip=False) or ""
+              src = script.get("src")
+              info = {"index": i, "src": src, "length": len(text)}
+              if text:
+                  name = f"inline_script_{i:03d}.js"
+                  (OUT / name).write_text(text, encoding="utf-8")
+                  info["saved_as"] = name
+                  info["contains_needles"] = [n for n in needles if n.casefold() in text.casefold()]
+                  info["preview"] = text[:1200]
+              scripts.append(info)
 
-          # Make repeated headers unique.
-          counts = {}
-          unique_columns = []
-          for col in df.columns:
-              counts[col] = counts.get(col, 0) + 1
-              unique_columns.append(col if counts[col] == 1 else f"{col}_{counts[col]}")
-          df.columns = unique_columns
-
-          for col in df.columns:
-              df[col] = df[col].map(lambda x: "" if pd.isna(x) else " ".join(str(x).split()).strip())
-
-          # Remove fully empty rows and repeated table-header rows if present.
-          df = df.loc[~df.apply(lambda row: all(v == "" for v in row), axis=1)].reset_index(drop=True)
-          header_signature = [c.casefold() for c in df.columns]
-          def is_repeated_header(row) -> bool:
-              vals = [str(v).casefold() for v in row.tolist()]
-              matches = sum(a == b for a, b in zip(vals, header_signature))
-              return matches >= max(3, len(header_signature) // 2)
-          if len(df):
-              df = df.loc[~df.apply(is_repeated_header, axis=1)].reset_index(drop=True)
-
-          df.to_csv(OUT / "catalogo_completo.csv", index=False, encoding="utf-8-sig")
-          df.to_excel(OUT / "catalogo_completo.xlsx", index=False)
-
-          n = len(df)
-          target = min(240, n)
-          if target:
-              positions = sorted(set(round(i * (n - 1) / max(target - 1, 1)) for i in range(target)))
-              sample = df.iloc[positions].copy()
-              sample.insert(0, "RIGA_CATALOGO", [p + 2 for p in positions])
-          else:
-              sample = df.copy()
-          sample.to_csv(OUT / "campione_sistematico.csv", index=False, encoding="utf-8-sig")
-          sample.to_excel(OUT / "campione_sistematico.xlsx", index=False)
-
-          missing = {}
-          distinct = {}
-          examples = {}
-          for col in df.columns:
-              empty = df[col].eq("")
-              missing[col] = {
-                  "empty_count": int(empty.sum()),
-                  "empty_pct": round(float(empty.mean() * 100), 2) if n else 0.0,
-              }
-              distinct[col] = int(df.loc[~empty, col].nunique())
-              examples[col] = df.loc[~empty, col].head(10).tolist()
-
-          summary = {
+          diagnostics = {
               "source_url": URL,
+              "status_code": response.status_code,
+              "content_type": response.headers.get("content-type"),
               "downloaded_bytes": len(content),
-              "tables_found": len(tables),
-              "rows": n,
-              "columns": len(df.columns),
-              "column_names": list(df.columns),
-              "missing_by_column": missing,
-              "distinct_nonempty_by_column": distinct,
-              "first_records": df.head(5).to_dict(orient="records"),
-              "last_records": df.tail(5).to_dict(orient="records"),
-              "examples_by_column": examples,
+              "encoding": response.encoding,
+              "title": soup.title.get_text(" ", strip=True) if soup.title else None,
+              "tag_counts": dict(tag_counts.most_common()),
+              "class_counts_top_100": dict(class_counts.most_common(100)),
+              "tables": len(soup.find_all("table")),
+              "rows_tr": len(soup.find_all("tr")),
+              "scripts": scripts,
+              "occurrences": occurrences,
+              "head_text": soup.get_text(" ", strip=True)[:5000],
+              "tail_text": soup.get_text(" ", strip=True)[-5000:],
           }
-          (OUT / "riepilogo_strutturale.json").write_text(
-              json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8"
+          (OUT / "diagnostica_html.json").write_text(
+              json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
           )
-          print(json.dumps({k: summary[k] for k in ("downloaded_bytes", "tables_found", "rows", "columns", "column_names")}, ensure_ascii=False, indent=2))
+
+          # Try direct HTML-table extraction, but do not fail when the catalogue is JavaScript-driven.
+          try:
+              tables = pd.read_html(io.BytesIO(content), displayed_only=False)
+          except ValueError:
+              tables = []
+          diagnostics["pandas_tables_found"] = len(tables)
+          if tables:
+              df = max(tables, key=lambda x: x.shape[0] * max(x.shape[1], 1)).copy()
+              df.to_csv(OUT / "tabella_estratta.csv", index=False, encoding="utf-8-sig")
+              df.to_excel(OUT / "tabella_estratta.xlsx", index=False)
+              diagnostics["largest_table_shape"] = list(df.shape)
+          (OUT / "diagnostica_html.json").write_text(
+              json.dumps(diagnostics, ensure_ascii=False, indent=2), encoding="utf-8"
+          )
+          print(json.dumps({
+              "downloaded_bytes": len(content),
+              "tables": diagnostics["tables"],
+              "rows_tr": diagnostics["rows_tr"],
+              "scripts": len(scripts),
+              "pandas_tables_found": diagnostics["pandas_tables_found"],
+              "top_tags": dict(tag_counts.most_common(12)),
+              "top_classes": dict(class_counts.most_common(20)),
+          }, ensure_ascii=False, indent=2))
           PY
 
       - name: Upload audit files
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: catalogo-bitonto-audit
